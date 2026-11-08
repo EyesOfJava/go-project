@@ -408,6 +408,8 @@ func getSession(r *http.Request) *Session {
 }
 
 func findUser(username, password string) *User {
+	mu.RLock()
+	defer mu.RUnlock()
 	for i := range users {
 		if users[i].Username == username && users[i].Password == password {
 			return &users[i]
@@ -417,6 +419,8 @@ func findUser(username, password string) *User {
 }
 
 func findUserByID(id string) *User {
+	mu.RLock()
+	defer mu.RUnlock()
 	for i := range users {
 		if users[i].ID == id {
 			return &users[i]
@@ -559,7 +563,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	// Check username exists
 	for _, u := range users {
 		if u.Username == username {
 			mu.Unlock()
@@ -568,6 +571,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
 	newUser := User{
 		ID:       fmt.Sprintf("u%d", nextUserID),
 		Username: username,
@@ -784,9 +788,11 @@ func paymentHandler(w http.ResponseWriter, r *http.Request) {
 				orders[i].PayMethod = payMethod
 				orders[i].PaidAt = &now
 				// Add points to user
-				u := findUserByID(orders[i].UserID)
-				if u != nil {
-					u.Points += orders[i].Total / 1000
+				for j := range users {
+					if users[j].ID == orders[i].UserID {
+						users[j].Points += orders[i].Total / 1000
+						break
+					}
 				}
 				break
 			}
