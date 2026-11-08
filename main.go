@@ -1,16 +1,26 @@
 package main
 
 import (
+	"context"
+	crand "crypto/rand"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/mail"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ===== Data Structs =====
@@ -50,14 +60,15 @@ type PointTier struct {
 }
 
 type User struct {
-	ID       string
-	Username string
-	Password string
-	Name     string
-	Email    string
-	Phone    string
-	Role     string
-	Points   int
+	ID           string
+	Username     string
+	PasswordHash string
+	Name         string
+	Email        string
+	Phone        string
+	Role         string
+	Points       int
+	IsActive     bool
 }
 
 type CartItem struct {
@@ -256,27 +267,14 @@ var promos = []Promo{
 	{Title: "Ulang Tahun? Kopi Gratis!", Desc: "Tunjukkan KTP di hari ulang tahunmu dan dapatkan minuman gratis.", Code: "HAPPYBDAY", Until: "Berlaku Sepanjang Tahun", Badge: "🎂 Spesial", BadgeType: "new", Discount: 100},
 }
 
-// ===== In-Memory Storage =====
-
+// ===== Application Storage =====
+// Akun pengguna disimpan permanen di MySQL.
+// Session dan data pesanan pada versi ini masih disimpan di memori.
 var (
 	mu       sync.RWMutex
 	sessions = map[string]*Session{}
 	orders   = []Order{}
-	users    = []User{
-		{ID: "u1", Username: "admin", Password: "admin123", Name: "Administrator", Email: "admin@kopiku.id", Phone: "08111111111", Role: "admin"},
-		{ID: "u2", Username: "kasir", Password: "kasir123", Name: "Kasir Sudirman", Email: "kasir@kopiku.id", Phone: "08222222222", Role: "kasir"},
-		{ID: "u3", Username: "user1", Password: "user123", Name: "Budi Santoso", Email: "budi@email.com", Phone: "08333333333", Role: "user", Points: 350},
-		{ID: "u4", Username: "user2", Password: "user456", Name: "Siti Rahayu", Email: "siti@email.com", Phone: "08444444444", Role: "user", Points: 1200},
-	}
-	nextUserID = 5
-
-	// Default fallback session agar website langsung dapat dijalankan dan dipesan tanpa wajib login
-	defaultGuestSession = &Session{
-		UserID:   "u3",
-		Username: "user1",
-		Role:     "user",
-		Name:     "Budi Santoso",
-	}
+	db       *sql.DB
 )
 
 var pointTiers = []PointTier{
@@ -393,40 +391,222 @@ func randID() string {
 	return fmt.Sprintf("%06d", rand.Intn(999999)+1)
 }
 
+// getEnv membaca environment variable dan menggunakan nilai default jika kosong.
+func getEnv(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// initDB membuka koneksi MySQL menggunakan konfigurasi environment variable.
+// Default konfigurasi sesuai instalasi XAMPP lokal: root tanpa password.
+func initDB() error {
+	cfg := mysql.Config{
+		User:                 getEnv("DB_USER", "root"),
+		Passwd:               os.Getenv("DB_PASSWORD"),
+		Net:                  "tcp",
+		Addr:                 net.JoinHostPort(getEnv("DB_HOST", "127.0.0.1"), getEnv("DB_PORT", "3306")),
+		DBName:               getEnv("DB_NAME", "kopiku_db"),
+		ParseTime:            true,
+		Loc:                  time.Local,
+		Collation:            "utf8mb4_unicode_ci",
+		AllowNativePasswords: true,
+		Params:               map[string]string{"charset": "utf8mb4"},
+	}
+
+	var err error
+	db, err = sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return fmt.Errorf("gagal membuka koneksi MySQL: %w", err)
+	}
+
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(3 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return fmt.Errorf("tidak dapat terhubung ke MySQL: %w", err)
+	}
+
+	// Buat tabel users jika belum ada
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS users (
+		id VARCHAR(64) PRIMARY KEY,
+		name VARCHAR(150) NOT NULL,
+		username VARCHAR(100) UNIQUE NOT NULL,
+		phone VARCHAR(30) DEFAULT '',
+		email VARCHAR(150) UNIQUE DEFAULT NULL,
+		password_hash VARCHAR(255) NOT NULL,
+		role VARCHAR(20) NOT NULL DEFAULT 'user',
+		points INT NOT NULL DEFAULT 0,
+		is_active TINYINT(1) NOT NULL DEFAULT 1,
+		last_login_at DATETIME NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
+	if _, err := db.ExecContext(ctx, createTableSQL); err != nil {
+		return fmt.Errorf("gagal menyiapkan tabel users di database kopiku_db: %w", err)
+	}
+
+	// Seed akun default bila tabel masih kosong
+	var userCount int
+	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&userCount)
+	if userCount == 0 {
+		type seedUser struct {
+			id, name, username, phone, email, pass, role string
+			points                                       int
+		}
+		defaultUsers := []seedUser{
+			{"u1", "Administrator", "admin", "08111111111", "admin@kopiku.id", "admin123", "admin", 0},
+			{"u2", "Kasir Sudirman", "kasir", "08222222222", "kasir@kopiku.id", "kasir123", "kasir", 0},
+			{"u3", "Budi Santoso", "user1", "08333333333", "budi@email.com", "user123", "user", 350},
+			{"u4", "Siti Rahayu", "user2", "08444444444", "siti@email.com", "user456", "user", 1200},
+		}
+		for _, du := range defaultUsers {
+			hash, err := bcrypt.GenerateFromPassword([]byte(du.pass), 10)
+			if err == nil {
+				_, _ = db.ExecContext(ctx, `
+					INSERT INTO users (id, name, username, phone, email, password_hash, role, points, is_active)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+					du.id, du.name, du.username, du.phone, du.email, string(hash), du.role, du.points)
+			}
+		}
+		log.Println("Data akun awal (admin, kasir, user1, user2) berhasil di-seed ke kopiku_db")
+	}
+
+	return nil
+}
+
+// newRandomID menghasilkan ID acak untuk session dan akun.
+func newRandomID() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%032x", time.Now().UnixNano())
+	}
+	// Format UUID v4.
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func setSessionCookie(w http.ResponseWriter, sessionID string) {
+	secure := strings.EqualFold(os.Getenv("COOKIE_SECURE"), "true")
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   86400,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   strings.EqualFold(os.Getenv("COOKIE_SECURE"), "true"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// getSession hanya mengembalikan session yang benar-benar terdaftar.
+// Tidak ada lagi fallback menjadi admin atau user demo secara otomatis.
 func getSession(r *http.Request) *Session {
 	cookie, err := r.Cookie("session_id")
-	if err == nil {
-		mu.RLock()
-		s, exists := sessions[cookie.Value]
-		mu.RUnlock()
-		if exists && s != nil {
-			return s
-		}
+	if err != nil || cookie.Value == "" {
+		return nil
 	}
-	// Fallback session agar seluruh fitur pemesanan tetap berjalan tanpa terhalang login
-	return defaultGuestSession
+	mu.RLock()
+	sess := sessions[cookie.Value]
+	mu.RUnlock()
+	return sess
 }
 
-func findUser(username, password string) *User {
-	mu.RLock()
-	defer mu.RUnlock()
-	for i := range users {
-		if users[i].Username == username && users[i].Password == password {
-			return &users[i]
-		}
+// getOrCreateSession membuat session tamu untuk alur pemesanan tanpa login.
+// ID tamu dibuat unik agar keranjang dan riwayat antar pengunjung tidak tercampur.
+func getOrCreateSession(w http.ResponseWriter, r *http.Request) *Session {
+	if sess := getSession(r); sess != nil {
+		return sess
 	}
-	return nil
+	sessionID := newRandomID()
+	sess := &Session{
+		UserID:   "guest-" + sessionID,
+		Username: "guest",
+		Role:     "guest",
+		Name:     "Tamu",
+	}
+	mu.Lock()
+	sessions[sessionID] = sess
+	mu.Unlock()
+	setSessionCookie(w, sessionID)
+	return sess
 }
 
-func findUserByID(id string) *User {
-	mu.RLock()
-	defer mu.RUnlock()
-	for i := range users {
-		if users[i].ID == id {
-			return &users[i]
-		}
+// getUserByUsername mengambil akun dan password hash dari MySQL.
+func getUserByUsername(username string) (*User, string, error) {
+	var u User
+	var passwordHash string
+	var active bool
+	err := db.QueryRowContext(context.Background(), `
+		SELECT id, name, username, phone, email, password_hash, role, points, is_active
+		FROM users
+		WHERE username = ?
+		LIMIT 1`, username).Scan(
+		&u.ID, &u.Name, &u.Username, &u.Phone, &u.Email,
+		&passwordHash, &u.Role, &u.Points, &active,
+	)
+	if err != nil {
+		return nil, "", err
 	}
-	return nil
+	u.PasswordHash = passwordHash
+	u.IsActive = active
+	return &u, passwordHash, nil
+}
+
+// getAllUsers mengambil daftar pengguna untuk tabel pengguna di dashboard admin.
+func getAllUsers() ([]User, error) {
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT id, name, username, email, phone, role, points, is_active
+		FROM users
+		ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	users := make([]User, 0)
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Name, &u.Username, &u.Email, &u.Phone, &u.Role, &u.Points, &u.IsActive); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+func isStaff(sess *Session) bool {
+	return sess != nil && (sess.Role == "admin" || sess.Role == "kasir")
+}
+
+func requireStaff(w http.ResponseWriter, r *http.Request) bool {
+	sess := getSession(r)
+	if !isStaff(sess) {
+		http.Error(w, "Akses ditolak. Silakan login sebagai admin atau kasir.", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func findPromo(code string) *Promo {
@@ -507,104 +687,169 @@ func poinHandler(w http.ResponseWriter, r *http.Request) {
 // ===== Auth Handlers =====
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	flash := getFlash(w, r)
 	if r.Method == http.MethodGet {
-		tplLogin.ExecuteTemplate(w, "login.html", map[string]string{"Flash": flash})
+		flash := getFlash(w, r)
+		_ = tplLogin.ExecuteTemplate(w, "login.html", map[string]string{"Flash": flash})
 		return
 	}
-	username := r.FormValue("username")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		addFlash(w, "Data login tidak valid.")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
-	u := findUser(username, password)
-	if u == nil {
-		addFlash(w, "Username atau password salah.")
-		http.Redirect(w, r, "/login", http.StatusFound)
+	if username == "" || password == "" {
+		addFlash(w, "Username dan password wajib diisi.")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	sessionID := fmt.Sprintf("%s-%d", randID(), time.Now().UnixNano())
+
+	u, passwordHash, err := getUserByUsername(username)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Gagal mengambil akun saat login: %v", err)
+		}
+		addFlash(w, "Username atau password salah.")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	if !u.IsActive || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)) != nil {
+		addFlash(w, "Username atau password salah.")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	// Catat waktu login terakhir.
+	if _, err := db.ExecContext(context.Background(),
+		"UPDATE users SET last_login_at = NOW() WHERE id = ?", u.ID); err != nil {
+		log.Printf("Gagal memperbarui last_login_at: %v", err)
+	}
+
+	// Rotasi session ID untuk mencegah session fixation.
+	if oldCookie, err := r.Cookie("session_id"); err == nil {
+		mu.Lock()
+		delete(sessions, oldCookie.Value)
+		mu.Unlock()
+	}
+	sessionID := newRandomID()
 	sess := &Session{UserID: u.ID, Username: u.Username, Role: u.Role, Name: u.Name}
 	mu.Lock()
 	sessions[sessionID] = sess
 	mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "session_id", Value: sessionID, Path: "/", MaxAge: 86400})
+	setSessionCookie(w, sessionID)
+
 	if u.Role == "admin" || u.Role == "kasir" {
-		http.Redirect(w, r, "/admin", http.StatusFound)
+		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 	} else {
-		http.Redirect(w, r, "/order", http.StatusFound)
+		http.Redirect(w, r, "/order", http.StatusSeeOther)
 	}
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
-	flash := getFlash(w, r)
 	if r.Method == http.MethodGet {
-		tplRegister.ExecuteTemplate(w, "register.html", RegisterData{Flash: flash})
+		flash := getFlash(w, r)
+		_ = tplRegister.ExecuteTemplate(w, "register.html", RegisterData{Flash: flash})
 		return
 	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		addFlash(w, "Data registrasi tidak valid.")
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
+		return
+	}
+
 	name := strings.TrimSpace(r.FormValue("name"))
 	username := strings.TrimSpace(r.FormValue("username"))
-	email := strings.TrimSpace(r.FormValue("email"))
+	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	phone := strings.TrimSpace(r.FormValue("phone"))
 	password := r.FormValue("password")
 	confirmPw := r.FormValue("confirm_password")
 
-	if name == "" || username == "" || password == "" {
+	if name == "" || username == "" || email == "" || phone == "" || password == "" || confirmPw == "" {
 		addFlash(w, "Semua field wajib diisi.")
-		http.Redirect(w, r, "/register", http.StatusFound)
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
+		return
+	}
+	if len(username) < 3 || len(username) > 50 {
+		addFlash(w, "Username harus terdiri dari 3 sampai 50 karakter.")
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
+		return
+	}
+	parsedEmail, emailErr := mail.ParseAddress(email)
+	if emailErr != nil || parsedEmail.Address != email {
+		addFlash(w, "Format email tidak valid.")
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
 		return
 	}
 	if password != confirmPw {
 		addFlash(w, "Konfirmasi password tidak cocok.")
-		http.Redirect(w, r, "/register", http.StatusFound)
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
 		return
 	}
-	if len(password) < 4 {
-		addFlash(w, "Password minimal 4 karakter.")
-		http.Redirect(w, r, "/register", http.StatusFound)
+	if len(password) < 8 {
+		addFlash(w, "Password minimal 8 karakter.")
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
 		return
 	}
 
-	mu.Lock()
-	for _, u := range users {
-		if u.Username == username {
-			mu.Unlock()
-			addFlash(w, "Username sudah dipakai, pilih yang lain.")
-			http.Redirect(w, r, "/register", http.StatusFound)
-			return
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		log.Printf("Gagal membuat password hash: %v", err)
+		addFlash(w, "Registrasi gagal. Silakan coba kembali.")
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
+		return
+	}
+
+	_, err = db.ExecContext(context.Background(), `
+		INSERT INTO users
+		(id, name, username, phone, email, password_hash, role, points, is_active)
+		VALUES (?, ?, ?, ?, ?, ?, 'user', 0, 1)`,
+		newRandomID(), name, username, phone, email, string(passwordHash))
+	if err != nil {
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+			addFlash(w, "Username atau email sudah digunakan. Gunakan data lain.")
+		} else {
+			log.Printf("Gagal menyimpan akun baru: %v", err)
+			addFlash(w, "Registrasi gagal karena masalah database. Silakan coba kembali.")
 		}
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
+		return
 	}
-
-	newUser := User{
-		ID:       fmt.Sprintf("u%d", nextUserID),
-		Username: username,
-		Password: password,
-		Name:     name,
-		Email:    email,
-		Phone:    phone,
-		Role:     "user",
-		Points:   0,
-	}
-	nextUserID++
-	users = append(users, newUser)
-	mu.Unlock()
 
 	addFlash(w, "Registrasi berhasil! Silakan login.")
-	http.Redirect(w, r, "/login", http.StatusFound)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie("session_id")
-	if err == nil {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if cookie, err := r.Cookie("session_id"); err == nil {
 		mu.Lock()
 		delete(sessions, cookie.Value)
 		mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session_id", Value: "", Path: "/", MaxAge: -1})
-	http.Redirect(w, r, "/", http.StatusFound)
+	clearSessionCookie(w)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // ===== Order Handlers (User) =====
 
 func orderHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	subtotal := cartSubtotal(sess.CartItems)
 	discount := 0
 	promoTitle := ""
@@ -630,7 +875,7 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func addToCartHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	itemName := r.FormValue("item")
 	qty, _ := strconv.Atoi(r.FormValue("qty"))
 	if qty < 1 {
@@ -666,7 +911,7 @@ func addToCartHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func removeFromCartHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	itemName := r.FormValue("item")
 	mu.Lock()
 	newCart := []CartItem{}
@@ -681,7 +926,7 @@ func removeFromCartHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func setBranchHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	branch := r.FormValue("branch")
 	mu.Lock()
 	sess.Branch = branch
@@ -691,7 +936,7 @@ func setBranchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	code := strings.ToUpper(strings.TrimSpace(r.FormValue("promo_code")))
 	p := findPromo(code)
 	if p == nil {
@@ -706,7 +951,7 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func removePromoHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	mu.Lock()
 	sess.PromoCode = ""
 	mu.Unlock()
@@ -714,7 +959,7 @@ func removePromoHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func checkoutHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	if len(sess.CartItems) == 0 {
 		addFlash(w, "Keranjang kosong, tambahkan item terlebih dahulu!")
 		http.Redirect(w, r, "/order", http.StatusFound)
@@ -762,7 +1007,7 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func paymentHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	orderID := strings.TrimPrefix(r.URL.Path, "/payment/")
 	mu.RLock()
 	var found *Order
@@ -774,32 +1019,39 @@ func paymentHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	mu.RUnlock()
-	if found == nil {
-		http.Redirect(w, r, "/order", http.StatusFound)
+	if found == nil || (found.UserID != sess.UserID && !isStaff(sess)) {
+		http.Redirect(w, r, "/order", http.StatusSeeOther)
 		return
 	}
 	if r.Method == http.MethodPost {
-		payMethod := r.FormValue("pay_method")
+		payMethod := strings.TrimSpace(r.FormValue("pay_method"))
 		now := time.Now()
+		var pointsUserID string
+		var pointsToAdd int
 		mu.Lock()
 		for i := range orders {
 			if orders[i].ID == orderID {
-				orders[i].Status = "paid"
-				orders[i].PayMethod = payMethod
-				orders[i].PaidAt = &now
-				// Add points to user
-				for j := range users {
-					if users[j].ID == orders[i].UserID {
-						users[j].Points += orders[i].Total / 1000
-						break
-					}
+				// Poin hanya ditambahkan saat status berubah dari belum dibayar menjadi paid.
+				if orders[i].Status != "paid" {
+					orders[i].Status = "paid"
+					orders[i].PayMethod = payMethod
+					orders[i].PaidAt = &now
+					pointsUserID = orders[i].UserID
+					pointsToAdd = orders[i].Total / 1000
 				}
 				break
 			}
 		}
 		mu.Unlock()
+
+		if pointsUserID != "" && !strings.HasPrefix(pointsUserID, "guest-") && pointsUserID != "walk-in" && pointsToAdd > 0 {
+			if _, err := db.ExecContext(context.Background(),
+				"UPDATE users SET points = points + ? WHERE id = ?", pointsToAdd, pointsUserID); err != nil {
+				log.Printf("Gagal menambahkan poin pelanggan: %v", err)
+			}
+		}
 		addFlash(w, "Pembayaran berhasil! Terima kasih, pesananmu sedang diproses. ☕")
-		http.Redirect(w, r, "/orders", http.StatusFound)
+		http.Redirect(w, r, "/orders", http.StatusSeeOther)
 		return
 	}
 	tplPayment.ExecuteTemplate(w, "layout", PaymentPage{
@@ -809,12 +1061,12 @@ func paymentHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func orderHistoryHandler(w http.ResponseWriter, r *http.Request) {
-	sess := getSession(r)
+	sess := getOrCreateSession(w, r)
 	mu.RLock()
 	var myOrders []Order
 	for i := len(orders) - 1; i >= 0; i-- {
-		// Tampilkan pesanan user atau semua pesanan jika guest
-		if orders[i].UserID == sess.UserID || sess.UserID == "u3" {
+		// Setiap pengguna hanya melihat pesanan milik session-nya sendiri.
+		if orders[i].UserID == sess.UserID {
 			myOrders = append(myOrders, orders[i])
 		}
 	}
@@ -829,15 +1081,20 @@ func orderHistoryHandler(w http.ResponseWriter, r *http.Request) {
 
 func adminHandler(w http.ResponseWriter, r *http.Request) {
 	sess := getSession(r)
-	// Jika belum login admin/kasir, berikan session admin default agar dashboard langsung bisa diakses
-	if sess == nil || (sess.Role != "admin" && sess.Role != "kasir") {
-		sess = &Session{UserID: "u1", Username: "admin", Role: "admin", Name: "Administrator"}
+	if !isStaff(sess) {
+		addFlash(w, "Silakan login menggunakan akun admin atau kasir.")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
 	}
 
 	mu.RLock()
 	allOrders := append([]Order{}, orders...)
-	allUsers := append([]User{}, users...)
 	mu.RUnlock()
+	allUsers, err := getAllUsers()
+	if err != nil {
+		log.Printf("Gagal mengambil daftar pengguna untuk dashboard: %v", err)
+		allUsers = []User{}
+	}
 	for i, j := 0, len(allOrders)-1; i < j; i, j = i+1, j-1 {
 		allOrders[i], allOrders[j] = allOrders[j], allOrders[i]
 	}
@@ -858,12 +1115,12 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if o.PromoCode != "" {
 			promoStats = append(promoStats, PromoUsageStat{
-				Code:     o.PromoCode,
-				Title:    o.PromoTitle,
-				UsedBy:   o.UserName,
-				Username: o.Username,
-				OrderID:  o.ID,
-				Discount: o.Discount,
+				Code:      o.PromoCode,
+				Title:     o.PromoTitle,
+				UsedBy:    o.UserName,
+				Username:  o.Username,
+				OrderID:   o.ID,
+				Discount:  o.Discount,
 				CreatedAt: o.CreatedAt,
 			})
 		}
@@ -885,6 +1142,9 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminUpdateOrderHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireStaff(w, r) {
+		return
+	}
 	orderID := r.FormValue("order_id")
 	status := r.FormValue("status")
 	mu.Lock()
@@ -905,6 +1165,9 @@ func adminUpdateOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 // Admin: Create order as cashier
 func adminCreateOrderHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireStaff(w, r) {
+		return
+	}
 	customerName := r.FormValue("customer_name")
 	branch := r.FormValue("branch")
 	promoCode := strings.ToUpper(strings.TrimSpace(r.FormValue("promo_code")))
@@ -980,6 +1243,13 @@ func adminCreateOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+
+	if err := initDB(); err != nil {
+		log.Fatalf("Database Kopiku tidak siap: %v", err)
+	}
+	defer db.Close()
+	log.Println("Berhasil terhubung ke database kopiku_db")
+
 	mux := http.NewServeMux()
 
 	// Public Pages
@@ -1010,6 +1280,11 @@ func main() {
 	mux.HandleFunc("/admin/order/update", adminUpdateOrderHandler)
 	mux.HandleFunc("/admin/order/create", adminCreateOrderHandler)
 
+	server := &http.Server{
+		Addr:              "localhost:8000",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	log.Println("Server berjalan di http://localhost:8000")
-	log.Fatal(http.ListenAndServe("localhost:8000", mux))
+	log.Fatal(server.ListenAndServe())
 }
